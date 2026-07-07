@@ -301,6 +301,18 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── FastAPI ───────────────────────────────────────────────────────────────────
 
+async def keep_alive():
+    """Ping self every 14 minutes so Render free tier doesn't sleep."""
+    while True:
+        await asyncio.sleep(14 * 60)
+        try:
+            async with httpx.AsyncClient(timeout=10) as c:
+                await c.get(WEBHOOK_URL + "/")
+            log.info("Keep-alive ping sent")
+        except Exception:
+            pass
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     ptb_app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
@@ -312,6 +324,9 @@ async def lifespan(app: FastAPI):
     await ptb_app.bot.set_webhook(webhook_path)
     log.info("Webhook set → %s", webhook_path)
     await ptb_app.start()
+
+    asyncio.create_task(keep_alive())
+
     yield
     await ptb_app.stop()
     await ptb_app.shutdown()
