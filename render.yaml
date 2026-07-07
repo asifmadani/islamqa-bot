@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: islamqa-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: TG_TOKEN
+        sync: false
+      - key: TG_CHAT_ID
+        sync: false
+      - key: GROQ_KEY
+        sync: false
+      - key: GH_TOKEN
+        sync: false
+      - key: WEBHOOK_URL
+        sync: false
