@@ -72,7 +72,7 @@ def extract_youtube_id(text: str) -> str | None:
 
 
 def parse_hashtag_msg(text: str) -> dict | None:
-    tag_m = re.search(r'#(video|maqalah|research|book)', text, re.IGNORECASE)
+    tag_m = re.search(r'#(video|maqalah|tafseer|tashreeh|research|book)', text, re.IGNORECASE)
     if not tag_m:
         return None
 
@@ -249,6 +249,40 @@ async def publish_maqalah(title: str, description: str) -> bool:
     return await gh_put_file("maqalah.html", sha, html.replace(marker, marker + block, 1), f"Maqalah: {title[:60]}")
 
 
+async def publish_tafseer(title: str, description: str) -> bool:
+    sha, html = await gh_get_file("tafseer.html")
+    if not sha:
+        return False
+    marker = "<!-- BOT:tafseer -->"
+    if marker not in html:
+        log.error("BOT:tafseer marker missing")
+        return False
+    block = (
+        f'\n      <div class="topic-card">\n'
+        f'        <h3>{title}</h3>\n'
+        f'        <p>{description}</p>\n'
+        f'      </div>\n'
+    )
+    return await gh_put_file("tafseer.html", sha, html.replace(marker, block + marker, 1), f"Tafseer: {title[:60]}")
+
+
+async def publish_tashreeh(title: str, description: str) -> bool:
+    sha, html = await gh_get_file("tashreeh.html")
+    if not sha:
+        return False
+    marker = "<!-- BOT:tashreeh -->"
+    if marker not in html:
+        log.error("BOT:tashreeh marker missing")
+        return False
+    block = (
+        f'\n      <div class="topic-card">\n'
+        f'        <h3>{title}</h3>\n'
+        f'        <p>{description}</p>\n'
+        f'      </div>\n'
+    )
+    return await gh_put_file("tashreeh.html", sha, html.replace(marker, block + marker, 1), f"Tashreeh: {title[:60]}")
+
+
 async def publish_research(title: str, description: str, pdf_filename: str = "") -> bool:
     sha, html = await gh_get_file("research.html")
     if not sha:
@@ -339,6 +373,20 @@ def review_text(q: dict) -> str:
             f"📝 *Content:* {q.get('description','')[:400]}\n\n"
             "_Approve karo to Maqalah page par add ho jaega._"
         )
+    elif t == "tafseer":
+        return (
+            "📜 *Tafseer — Review karo:*\n\n"
+            f"📌 *Title:* {q.get('title','')}\n"
+            f"📝 *Content:* {q.get('description','')[:400]}\n\n"
+            "_Approve karo to Tafseer page par add ho jaega._"
+        )
+    elif t == "tashreeh":
+        return (
+            "📋 *Tashreeh — Review karo:*\n\n"
+            f"📌 *Title:* {q.get('title','')}\n"
+            f"📝 *Content:* {q.get('description','')[:400]}\n\n"
+            "_Approve karo to Tashreeh page par add ho jaega._"
+        )
     elif t == "research":
         pdf = f"📎 *PDF:* `{q.get('pdf_filename','')}`\n" if q.get("pdf_filename") else "📎 *PDF:* nahi\n"
         return (
@@ -364,6 +412,8 @@ PAGE_URLS = {
     "qa":       "https://asifmadani.github.io/qa.html",
     "video":    "https://asifmadani.github.io/videos.html",
     "maqalah":  "https://asifmadani.github.io/maqalah.html",
+    "tafseer":  "https://asifmadani.github.io/tafseer.html",
+    "tashreeh": "https://asifmadani.github.io/tashreeh.html",
     "research": "https://asifmadani.github.io/research.html",
     "book":     "https://asifmadani.github.io/books.html",
 }
@@ -439,7 +489,7 @@ async def on_hashtag_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
 
         text = (msg.text or "") + " " + (msg.caption or "")
-        if not re.search(r'#(video|maqalah|research|book)', text, re.IGNORECASE):
+        if not re.search(r'#(video|maqalah|tafseer|tashreeh|research|book)', text, re.IGNORECASE):
             return
 
         log.info("Hashtag detected in: %s", text[:100])
@@ -558,6 +608,12 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         elif content_type == "maqalah":
             ok = await publish_maqalah(q["title"], q.get("description", ""))
+
+        elif content_type == "tafseer":
+            ok = await publish_tafseer(q["title"], q.get("description", ""))
+
+        elif content_type == "tashreeh":
+            ok = await publish_tashreeh(q["title"], q.get("description", ""))
 
         elif content_type == "research":
             pdf_fn = q.get("pdf_filename", "")
@@ -767,14 +823,16 @@ def apply_edit(old_block: str, new_title: str, new_desc: str) -> str:
 _PAGE_CFG = {
     "qa":       ("qa.html",       "qa-item",    "<h2>Published Answers</h2>", ""),
     "maqalah":  ("maqalah.html",  "topic-card", 'id="bot-maqalah">',         "<!-- BOT:maqalah -->"),
+    "tafseer":  ("tafseer.html",  "topic-card", 'id="bot-tafseer">',         "<!-- BOT:tafseer -->"),
+    "tashreeh": ("tashreeh.html", "topic-card", 'id="bot-tashreeh">',        "<!-- BOT:tashreeh -->"),
     "research": ("research.html", "pub-card",   '<div class="pub-list">',    "<!-- BOT:research -->"),
     "books":    ("books.html",    "pub-card",   '<div class="pub-list">',    "<!-- BOT:books -->"),
     "video":    ("videos.html",   "video-card", "<!-- BOT:video -->",         ""),
 }
 
 _PAGE_LABEL = {
-    "qa": "Q&A", "maqalah": "Maqalah",
-    "research": "Research", "books": "Books", "video": "Videos",
+    "qa": "Q&A", "maqalah": "Maqalah", "tafseer": "Tafseer",
+    "tashreeh": "Tashreeh", "research": "Research", "books": "Books", "video": "Videos",
 }
 
 
@@ -794,15 +852,19 @@ async def fetch_blocks(page: str) -> tuple[list[str], str, str] | tuple[None, No
 def _page_select_keyboard(op: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("❓ Q&A",      callback_data=f"mgr|{op}|qa"),
-            InlineKeyboardButton("📚 Maqalah",  callback_data=f"mgr|{op}|maqalah"),
+            InlineKeyboardButton("❓ Q&A",       callback_data=f"mgr|{op}|qa"),
+            InlineKeyboardButton("📚 Maqalah",   callback_data=f"mgr|{op}|maqalah"),
         ],
         [
-            InlineKeyboardButton("🔬 Research", callback_data=f"mgr|{op}|research"),
-            InlineKeyboardButton("📖 Books",    callback_data=f"mgr|{op}|books"),
+            InlineKeyboardButton("📜 Tafseer",   callback_data=f"mgr|{op}|tafseer"),
+            InlineKeyboardButton("📋 Tashreeh",  callback_data=f"mgr|{op}|tashreeh"),
         ],
-        [InlineKeyboardButton("🎬 Videos",      callback_data=f"mgr|{op}|video")],
-        [InlineKeyboardButton("❌ Cancel",       callback_data="mgr|cancel|_")],
+        [
+            InlineKeyboardButton("🔬 Research",  callback_data=f"mgr|{op}|research"),
+            InlineKeyboardButton("📖 Books",     callback_data=f"mgr|{op}|books"),
+        ],
+        [InlineKeyboardButton("🎬 Videos",       callback_data=f"mgr|{op}|video")],
+        [InlineKeyboardButton("❌ Cancel",        callback_data="mgr|cancel|_")],
     ])
 
 
