@@ -63,7 +63,7 @@ def parse_question_msg(text: str) -> dict:
 
 def extract_youtube_id(text: str) -> str | None:
     m = re.search(
-        r'(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/)([A-Za-z0-9_-]{11})',
+        r'(?:youtube\.com/watch\?[^"]*v=|youtu\.be/|youtube\.com/(?:shorts|live|embed)/)([A-Za-z0-9_-]{11})',
         text,
     )
     return m.group(1) if m else None
@@ -427,20 +427,28 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def on_hashtag_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handle #video / #maqalah / #research / #book messages."""
-    msg = update.message
-    if not msg or msg.chat_id != TG_CHAT_ID:
-        return
+    try:
+        msg = update.message
+        if not msg or msg.chat_id != TG_CHAT_ID:
+            return
 
-    # Don't intercept if user is in edit mode
-    if msg.from_user and msg.from_user.id in editing_state:
-        return
+        # Don't intercept if user is in edit mode
+        if msg.from_user and msg.from_user.id in editing_state:
+            return
 
-    text = (msg.text or "") + " " + (msg.caption or "")
-    if not re.search(r'#(video|maqalah|research|book)', text, re.IGNORECASE):
-        return
+        text = (msg.text or "") + " " + (msg.caption or "")
+        if not re.search(r'#(video|maqalah|research|book)', text, re.IGNORECASE):
+            return
 
-    parsed = parse_hashtag_msg(text)
-    if not parsed:
+        log.info("Hashtag detected in: %s", text[:100])
+        parsed = parse_hashtag_msg(text)
+        if not parsed:
+            log.error("parse_hashtag_msg returned None for: %s", text[:100])
+            return
+        log.info("Parsed: type=%s title=%s", parsed.get('type'), parsed.get('title'))
+    except Exception as exc:
+        log.exception("on_hashtag_msg early error")
+        await ctx.bot.send_message(chat_id=TG_CHAT_ID, text=f"❌ Bot error (early): {exc}")
         return
 
     content_type = parsed["type"]
@@ -498,16 +506,24 @@ async def on_hashtag_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    key = str(msg.message_id)
-    pending_review[key] = parsed
+    try:
+        key = str(msg.message_id)
+        pending_review[key] = parsed
 
-    await ctx.bot.send_message(
-        chat_id=TG_CHAT_ID,
-        text=review_text(parsed),
-        parse_mode="Markdown",
-        reply_markup=review_keyboard(key),
-        reply_to_message_id=msg.message_id,
-    )
+        await ctx.bot.send_message(
+            chat_id=TG_CHAT_ID,
+            text=review_text(parsed),
+            parse_mode="Markdown",
+            reply_markup=review_keyboard(key),
+            reply_to_message_id=msg.message_id,
+        )
+    except Exception as exc:
+        log.exception("on_hashtag_msg send error")
+        await ctx.bot.send_message(
+            chat_id=TG_CHAT_ID,
+            text=f"❌ Bot error (send): {exc}\n\nContent type: {parsed.get('type')}\nTitle: {parsed.get('title','')[:50]}",
+            reply_to_message_id=msg.message_id,
+        )
 
 
 async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -653,16 +669,28 @@ async def keep_alive():
             pass
 
 
+async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE):
+    log.error("PTB error: %s", ctx.error, exc_info=ctx.error)
+    try:
+        await ctx.bot.send_message(
+            chat_id=TG_CHAT_ID,
+            text=f"⚠️ Bot internal error:\n{type(ctx.error).__name__}: {ctx.error}",
+        )
+    except Exception:
+        pass
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Register handlers (order matters — voice first, then hashtag, then callback, then edit)
     ptb_app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
     ptb_app.add_handler(MessageHandler(
         (filters.TEXT | filters.CAPTION | filters.Document.ALL) & ~filters.COMMAND,
         on_hashtag_msg,
     ))
     ptb_app.add_handler(CallbackQueryHandler(on_callback))
-    ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    # group=1 so on_text runs even after on_hashtag_msg consumed the update in group=0
+    ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text), group=1)
+    ptb_app.add_error_handler(on_error)
 
     await ptb_app.initialize()
 
