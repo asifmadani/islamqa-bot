@@ -18,7 +18,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application, MessageHandler, CallbackQueryHandler,
+    Application, MessageHandler, CallbackQueryHandler, CommandHandler,
     filters, ContextTypes,
 )
 from groq import Groq
@@ -39,6 +39,8 @@ groq_client = Groq(api_key=GROQ_KEY)
 # ── In-memory state ────────────────────────────────────────────────────────────
 pending_review: dict[str, dict] = {}
 editing_state: dict[int, str] = {}
+manage_cache: dict[int, dict] = {}   # user_id → {op, page, blocks}
+edit_draft:   dict[int, dict] = {}   # user_id → {page, idx, old_block}
 
 # ── Telegram app ───────────────────────────────────────────────────────────────
 ptb_app = Application.builder().token(TG_TOKEN).build()
@@ -527,9 +529,14 @@ async def on_hashtag_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Approve / Edit / Discard button handler."""
+    """Approve / Edit / Discard button handler + delete/edit management."""
     query = update.callback_query
     await query.answer()
+
+    # Route manage callbacks to separate handler
+    if query.data.startswith("mgr|"):
+        await handle_manage_callback(query, ctx)
+        return
 
     action, key = query.data.split("|", 1)
     q = pending_review.get(key)
@@ -625,12 +632,49 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Capture edited text from Sheikh in edit mode."""
+    """Capture edited text from Sheikh — handles both review-edit and delete/edit flows."""
     msg = update.message
     if not msg or msg.chat_id != TG_CHAT_ID:
         return
     user_id = msg.from_user.id if msg.from_user else None
-    if not user_id or user_id not in editing_state:
+    if not user_id:
+        return
+
+    # ── Delete/Edit flow: new content for an existing live item ───────────────
+    if user_id in edit_draft:
+        draft = edit_draft.pop(user_id)
+        lines     = (msg.text or "").strip().split('\n', 1)
+        new_title = lines[0].strip()
+        new_desc  = lines[1].strip() if len(lines) > 1 else ""
+
+        page      = draft["page"]
+        old_block = draft["old_block"]
+        new_block = apply_edit(old_block, new_title, new_desc)
+
+        cfg = _PAGE_CFG[page]
+        sha, html = await gh_get_file(cfg[0])
+        if not sha:
+            await msg.reply_text("❌ GitHub fetch fail hua.")
+            return
+        if old_block not in html:
+            await msg.reply_text("❌ Item nahi mila. Shayad already change ho gaya?")
+            return
+
+        new_html = html.replace(old_block, new_block, 1)
+        ok = await gh_put_file(cfg[0], sha, new_html, f"Edit: {new_title[:50]}")
+
+        if ok:
+            await msg.reply_text(
+                f"✅ Update ho gaya!\n\n*{new_title}*\n{new_desc[:150]}\n\n"
+                f"🔗 {PAGE_URLS.get(page, '')}",
+                parse_mode="Markdown",
+            )
+        else:
+            await msg.reply_text("❌ GitHub update fail hua.")
+        return
+
+    # ── Review-edit flow: editing pending review draft ─────────────────────────
+    if user_id not in editing_state:
         return
 
     key = editing_state.pop(user_id)
@@ -651,6 +695,248 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
         reply_markup=review_keyboard(key),
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DELETE / EDIT — HTML EXTRACTION HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _div_end(html: str, start: int) -> int:
+    """Return end position of a <div> block starting at `start`, counting nested divs."""
+    depth, i = 0, start
+    while i < len(html):
+        if html[i:i+4] == "<div":
+            depth += 1
+            j = html.find(">", i)
+            i = j + 1 if j != -1 else i + 4
+        elif html[i:i+6] == "</div>":
+            depth -= 1
+            if depth == 0:
+                return i + 6
+            i += 6
+        else:
+            i += 1
+    return -1
+
+
+def find_blocks(html: str, class_name: str, start_after: str = "", stop_before: str = "") -> list[str]:
+    """Extract all <div class="class_name">...</div> blocks in a section of html."""
+    s, e = 0, len(html)
+    if start_after and start_after in html:
+        s = html.index(start_after) + len(start_after)
+    if stop_before:
+        idx = html.find(stop_before, s)
+        if idx != -1:
+            e = idx
+
+    tag, blocks, pos = f'class="{class_name}"', [], s
+    while pos < e:
+        ci = html.find(tag, pos, e)
+        if ci == -1:
+            break
+        di = html.rfind("<div", pos, ci)
+        if di == -1:
+            pos = ci + len(tag)
+            continue
+        end = _div_end(html, di)
+        if end == -1 or end > e:
+            break
+        blocks.append(html[di:end])
+        pos = end
+    return blocks
+
+
+def block_title(block: str) -> str:
+    m = re.search(r"<h3>(.*?)</h3>", block, re.DOTALL)
+    return re.sub(r"<[^>]+>", "", m.group(1)).strip() if m else "Untitled"
+
+
+def block_desc(block: str) -> str:
+    m = re.search(r"<p>(.*?)</p>", block, re.DOTALL)
+    return re.sub(r"<[^>]+>", "", m.group(1)).strip()[:200] if m else ""
+
+
+def apply_edit(old_block: str, new_title: str, new_desc: str) -> str:
+    """Replace <h3> and first <p> in a block with new values."""
+    b = re.sub(r"<h3>.*?</h3>", f"<h3>{new_title}</h3>", old_block, count=1, flags=re.DOTALL)
+    b = re.sub(r"<p>.*?</p>", f"<p>{new_desc}</p>", b, count=1, flags=re.DOTALL)
+    return b
+
+
+# page_type → (filename, div_class, start_after, stop_before)
+_PAGE_CFG = {
+    "qa":       ("qa.html",       "qa-item",    "<h2>Published Answers</h2>", ""),
+    "maqalah":  ("maqalah.html",  "topic-card", 'id="bot-maqalah">',         "<!-- BOT:maqalah -->"),
+    "research": ("research.html", "pub-card",   '<div class="pub-list">',    "<!-- BOT:research -->"),
+    "books":    ("books.html",    "pub-card",   '<div class="pub-list">',    "<!-- BOT:books -->"),
+    "video":    ("videos.html",   "video-card", "<!-- BOT:video -->",         ""),
+}
+
+_PAGE_LABEL = {
+    "qa": "Q&A", "maqalah": "Maqalah",
+    "research": "Research", "books": "Books", "video": "Videos",
+}
+
+
+async def fetch_blocks(page: str) -> tuple[list[str], str, str] | tuple[None, None, None]:
+    cfg = _PAGE_CFG.get(page)
+    if not cfg:
+        return None, None, None
+    filename, cls, start, stop = cfg
+    sha, html = await gh_get_file(filename)
+    if not sha:
+        return None, None, None
+    return find_blocks(html, cls, start, stop), sha, html
+
+
+# ── /delete and /edit command handlers ────────────────────────────────────────
+
+def _page_select_keyboard(op: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("❓ Q&A",      callback_data=f"mgr|{op}|qa"),
+            InlineKeyboardButton("📚 Maqalah",  callback_data=f"mgr|{op}|maqalah"),
+        ],
+        [
+            InlineKeyboardButton("🔬 Research", callback_data=f"mgr|{op}|research"),
+            InlineKeyboardButton("📖 Books",    callback_data=f"mgr|{op}|books"),
+        ],
+        [InlineKeyboardButton("🎬 Videos",      callback_data=f"mgr|{op}|video")],
+        [InlineKeyboardButton("❌ Cancel",       callback_data="mgr|cancel|_")],
+    ])
+
+
+async def on_delete_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg or msg.chat_id != TG_CHAT_ID:
+        return
+    await msg.reply_text(
+        "🗑️ *Delete — Kaunsa page?*",
+        parse_mode="Markdown",
+        reply_markup=_page_select_keyboard("del"),
+    )
+
+
+async def on_edit_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg or msg.chat_id != TG_CHAT_ID:
+        return
+    await msg.reply_text(
+        "✏️ *Edit — Kaunsa page?*",
+        parse_mode="Markdown",
+        reply_markup=_page_select_keyboard("edt"),
+    )
+
+
+async def handle_manage_callback(query, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle all mgr|* callbacks for delete / edit flows."""
+    parts   = query.data.split("|")
+    op      = parts[1]   # del, edt, item, confirm, cancel
+    page    = parts[2] if len(parts) > 2 else "_"
+    user_id = query.from_user.id
+
+    if op == "cancel":
+        manage_cache.pop(user_id, None)
+        edit_draft.pop(user_id, None)
+        await query.edit_message_text("❌ Cancel ho gaya.")
+        return
+
+    # ── Page selected → show item list ────────────────────────────────────────
+    if op in ("del", "edt"):
+        await query.edit_message_text("⏳ Items load ho rahe hain...")
+        blocks, sha, html = await fetch_blocks(page)
+        if blocks is None:
+            await query.edit_message_text("❌ Page fetch fail hua.")
+            return
+        if not blocks:
+            await query.edit_message_text(
+                f"📭 {_PAGE_LABEL[page]} par abhi koi bot-added item nahi hai."
+            )
+            return
+
+        manage_cache[user_id] = {"op": op, "page": page, "blocks": blocks}
+        emoji = "🗑️" if op == "del" else "✏️"
+        text  = f"{emoji} *{_PAGE_LABEL[page]} — item select karo:*\n\n"
+        btns  = []
+        for i, blk in enumerate(blocks):
+            title = block_title(blk)[:40]
+            text += f"{i+1}. {title}\n"
+            btns.append([InlineKeyboardButton(
+                f"{i+1}. {title[:35]}",
+                callback_data=f"mgr|item|{page}|{i}",
+            )])
+        btns.append([InlineKeyboardButton("❌ Cancel", callback_data="mgr|cancel|_")])
+        await query.edit_message_text(text, parse_mode="Markdown",
+                                      reply_markup=InlineKeyboardMarkup(btns))
+        return
+
+    # ── Item selected ──────────────────────────────────────────────────────────
+    if op == "item":
+        idx   = int(parts[3])
+        cache = manage_cache.get(user_id, {})
+        if cache.get("page") != page:
+            await query.edit_message_text("⚠️ Session expire ho gaya. /delete ya /edit dobara karo.")
+            return
+
+        real_op = cache["op"]
+        blk     = cache["blocks"][idx]
+        title   = block_title(blk)
+        desc    = block_desc(blk)
+
+        if real_op == "del":
+            await query.edit_message_text(
+                f"🗑️ *Delete confirm karo:*\n\n*{title}*\n{desc[:200]}\n\n_Yeh undo nahi hoga!_",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ Haan, Delete!", callback_data=f"mgr|confirm|{page}|{idx}")],
+                    [InlineKeyboardButton("❌ Cancel",        callback_data="mgr|cancel|_")],
+                ]),
+            )
+        else:  # edit
+            edit_draft[user_id] = {"page": page, "idx": idx, "old_block": blk}
+            await query.edit_message_text(
+                f"✏️ *Edit — {_PAGE_LABEL[page]}:*\n\n"
+                f"*Purana title:* {title}\n"
+                f"*Purana content:* {desc[:200]}\n\n"
+                "Naya content bhejo:\n"
+                "_Line 1 = Title_\n_Line 2+ = Description_",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("❌ Cancel", callback_data="mgr|cancel|_")
+                ]]),
+            )
+        return
+
+    # ── Confirm delete ─────────────────────────────────────────────────────────
+    if op == "confirm":
+        idx   = int(parts[3])
+        cache = manage_cache.pop(user_id, {})
+        if not cache or cache.get("page") != page:
+            await query.edit_message_text("⚠️ Session expire ho gaya.")
+            return
+
+        blk   = cache["blocks"][idx]
+        title = block_title(blk)
+        cfg   = _PAGE_CFG[page]
+
+        sha, html = await gh_get_file(cfg[0])
+        if not sha:
+            await query.edit_message_text("❌ GitHub fetch fail hua.")
+            return
+        if blk not in html:
+            await query.edit_message_text("❌ Item HTML mein nahi mila. Shayad already delete ho gaya?")
+            return
+
+        new_html = html.replace(blk, "", 1)
+        ok = await gh_put_file(cfg[0], sha, new_html, f"Delete: {title[:50]}")
+
+        if ok:
+            await query.edit_message_text(
+                f"✅ *Delete ho gaya!*\n\n_{title}_\n\n🔗 {PAGE_URLS.get(page, '')}",
+                parse_mode="Markdown",
+            )
+        else:
+            await query.edit_message_text("❌ GitHub update fail hua.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -682,13 +968,15 @@ async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    ptb_app.add_handler(CommandHandler("delete", on_delete_cmd))
+    ptb_app.add_handler(CommandHandler("edit",   on_edit_cmd))
     ptb_app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
     ptb_app.add_handler(MessageHandler(
         (filters.TEXT | filters.CAPTION | filters.Document.ALL) & ~filters.COMMAND,
         on_hashtag_msg,
     ))
     ptb_app.add_handler(CallbackQueryHandler(on_callback))
-    # group=1 so on_text runs even after on_hashtag_msg consumed the update in group=0
+    # group=1 so on_text always runs even after on_hashtag_msg consumed the update in group=0
     ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text), group=1)
     ptb_app.add_error_handler(on_error)
 
