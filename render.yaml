@@ -15,3 +15,5 @@ services:
         sync: false
       - key: WEBHOOK_URL
         sync: false
+      - key: ADMIN_PASSWORD
+        sync: false

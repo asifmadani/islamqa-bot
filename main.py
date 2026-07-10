@@ -9,13 +9,14 @@ Handles:
   - #book: title + language + PDF → approve → upload PDF + publish to books.html
 """
 
-import os, re, base64, logging, asyncio, tempfile
+import os, re, base64, logging, asyncio, tempfile, secrets
 from contextlib import asynccontextmanager
 from datetime import datetime
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, MessageHandler, CallbackQueryHandler, CommandHandler,
@@ -24,12 +25,13 @@ from telegram.ext import (
 from groq import Groq
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-TG_TOKEN    = os.environ["TG_TOKEN"]
-TG_CHAT_ID  = int(os.environ["TG_CHAT_ID"])
-GROQ_KEY    = os.environ["GROQ_KEY"]
-GH_TOKEN    = os.environ["GH_TOKEN"]
-GH_REPO     = "asifmadani/asifmadani.github.io"
-WEBHOOK_URL = os.environ["WEBHOOK_URL"]
+TG_TOKEN       = os.environ["TG_TOKEN"]
+TG_CHAT_ID     = int(os.environ["TG_CHAT_ID"])
+GROQ_KEY       = os.environ["GROQ_KEY"]
+GH_TOKEN       = os.environ["GH_TOKEN"]
+GH_REPO        = "asifmadani/asifmadani.github.io"
+WEBHOOK_URL    = os.environ["WEBHOOK_URL"]
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -41,6 +43,7 @@ pending_review: dict[str, dict] = {}
 editing_state: dict[int, str] = {}
 manage_cache: dict[int, dict] = {}   # user_id → {op, page, blocks}
 edit_draft:   dict[int, dict] = {}   # user_id → {page, idx, old_block}
+admin_tokens: set[str] = set()       # issued admin panel session tokens
 
 # ── Telegram app ───────────────────────────────────────────────────────────────
 ptb_app = Application.builder().token(TG_TOKEN).build()
@@ -232,6 +235,15 @@ async def publish_video(title: str, description: str, youtube_id: str) -> bool:
     return await gh_put_file("videos.html", sha, html.replace(marker, marker + block, 1), f"Video: {title[:60]}")
 
 
+def render_topic_block(title: str, content_html: str) -> str:
+    return (
+        f'\n      <div class="topic-card">\n'
+        f'        <h3>{title}</h3>\n'
+        f'        <div class="content-body">{content_html}</div>\n'
+        f'      </div>\n'
+    )
+
+
 async def publish_maqalah(title: str, description: str) -> bool:
     sha, html = await gh_get_file("maqalah.html")
     if not sha:
@@ -240,12 +252,7 @@ async def publish_maqalah(title: str, description: str) -> bool:
     if marker not in html:
         log.error("BOT:maqalah marker missing")
         return False
-    block = (
-        f'\n      <div class="topic-card">\n'
-        f'        <h3>{title}</h3>\n'
-        f'        <p>{description}</p>\n'
-        f'      </div>\n'
-    )
+    block = render_topic_block(title, f"<p>{description}</p>")
     return await gh_put_file("maqalah.html", sha, html.replace(marker, marker + block, 1), f"Maqalah: {title[:60]}")
 
 
@@ -257,12 +264,7 @@ async def publish_tafseer(title: str, description: str) -> bool:
     if marker not in html:
         log.error("BOT:tafseer marker missing")
         return False
-    block = (
-        f'\n      <div class="topic-card">\n'
-        f'        <h3>{title}</h3>\n'
-        f'        <p>{description}</p>\n'
-        f'      </div>\n'
-    )
+    block = render_topic_block(title, f"<p>{description}</p>")
     return await gh_put_file("tafseer.html", sha, html.replace(marker, block + marker, 1), f"Tafseer: {title[:60]}")
 
 
@@ -274,12 +276,7 @@ async def publish_tashreeh(title: str, description: str) -> bool:
     if marker not in html:
         log.error("BOT:tashreeh marker missing")
         return False
-    block = (
-        f'\n      <div class="topic-card">\n'
-        f'        <h3>{title}</h3>\n'
-        f'        <p>{description}</p>\n'
-        f'      </div>\n'
-    )
+    block = render_topic_block(title, f"<p>{description}</p>")
     return await gh_put_file("tashreeh.html", sha, html.replace(marker, block + marker, 1), f"Tashreeh: {title[:60]}")
 
 
@@ -802,6 +799,34 @@ def find_blocks(html: str, class_name: str, start_after: str = "", stop_before: 
     return blocks
 
 
+def extract_div(html: str, class_name: str) -> str | None:
+    """Return the inner HTML of the first <div class="class_name">...</div> found."""
+    tag = f'class="{class_name}"'
+    ci = html.find(tag)
+    if ci == -1:
+        return None
+    di = html.rfind("<div", 0, ci)
+    if di == -1:
+        return None
+    end = _div_end(html, di)
+    if end == -1:
+        return None
+    inner_start = html.find(">", di) + 1
+    return html[inner_start:end - 6]
+
+
+def apply_rich_edit(old_block: str, new_title: str, new_content_html: str) -> str:
+    """Replace <h3> and the content-body div's inner HTML with admin-supplied rich HTML."""
+    b = re.sub(r"<h3>.*?</h3>", f"<h3>{new_title}</h3>", old_block, count=1, flags=re.DOTALL)
+    tag = 'class="content-body"'
+    ci = b.find(tag)
+    if ci == -1:
+        return b
+    di = b.rfind("<div", 0, ci)
+    end = _div_end(b, di)
+    return b[:di] + f'<div class="content-body">{new_content_html}</div>' + b[end:]
+
+
 def block_title(block: str) -> str:
     m = re.search(r"<h3>(.*?)</h3>", block, re.DOTALL)
     return re.sub(r"<[^>]+>", "", m.group(1)).strip() if m else "Untitled"
@@ -1079,4 +1104,119 @@ async def tg_webhook(request: Request):
     body   = await request.json()
     update = Update.de_json(body, ptb_app.bot)
     await ptb_app.process_update(update)
+    return {"ok": True}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ADMIN PANEL API
+# Only maqalah/tafseer/tashreeh are managed here — research/books/video need
+# PDF/YouTube uploads and stay on the Telegram bot flow for now.
+# ══════════════════════════════════════════════════════════════════════════════
+
+ADMIN_PAGES = ["maqalah", "tafseer", "tashreeh"]
+# Matches each publish_* function's existing insertion order (maqalah appends
+# after the marker, tafseer/tashreeh append before it).
+_INSERT_AFTER_MARKER = {"maqalah": True, "tafseer": False, "tashreeh": False}
+
+
+class LoginBody(BaseModel):
+    password: str
+
+
+class ContentBody(BaseModel):
+    title: str
+    content: str
+
+
+def require_admin(authorization: str = Header(default="")) -> None:
+    token = authorization.removeprefix("Bearer ").strip()
+    if not ADMIN_PASSWORD or not token or token not in admin_tokens:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def _admin_page_or_404(page: str) -> tuple:
+    if page not in ADMIN_PAGES:
+        raise HTTPException(status_code=404, detail="Page not managed by admin panel")
+    return _PAGE_CFG[page]
+
+
+@app.post("/admin/login")
+async def admin_login(body: LoginBody):
+    if not ADMIN_PASSWORD or body.password != ADMIN_PASSWORD:
+        raise HTTPException(status_code=401, detail="Wrong password")
+    token = secrets.token_hex(32)
+    admin_tokens.add(token)
+    return {"token": token}
+
+
+@app.get("/admin/pages")
+async def admin_pages(_: None = Depends(require_admin)):
+    return {"pages": [{"key": p, "label": _PAGE_LABEL[p]} for p in ADMIN_PAGES]}
+
+
+@app.get("/admin/content/{page}")
+async def admin_get_content(page: str, _: None = Depends(require_admin)):
+    _admin_page_or_404(page)
+    blocks, sha, html = await fetch_blocks(page)
+    if blocks is None:
+        raise HTTPException(status_code=502, detail="GitHub fetch failed")
+    items = [
+        {"idx": i, "title": block_title(blk), "content": extract_div(blk, "content-body") or ""}
+        for i, blk in enumerate(blocks)
+    ]
+    return {"items": items}
+
+
+@app.post("/admin/content/{page}")
+async def admin_add_content(page: str, body: ContentBody, _: None = Depends(require_admin)):
+    cfg = _admin_page_or_404(page)
+    filename, _cls, start_after, stop_before = cfg
+    marker = stop_before or start_after
+    sha, html = await gh_get_file(filename)
+    if not sha:
+        raise HTTPException(status_code=502, detail="GitHub fetch failed")
+    if marker not in html:
+        raise HTTPException(status_code=500, detail="Insertion marker missing in page")
+    block = render_topic_block(body.title, body.content)
+    new_html = (
+        html.replace(marker, marker + block, 1)
+        if _INSERT_AFTER_MARKER.get(page, True)
+        else html.replace(marker, block + marker, 1)
+    )
+    ok = await gh_put_file(filename, sha, new_html, f"Admin add: {body.title[:50]}")
+    if not ok:
+        raise HTTPException(status_code=502, detail="GitHub update failed")
+    return {"ok": True}
+
+
+@app.put("/admin/content/{page}/{idx}")
+async def admin_edit_content(page: str, idx: int, body: ContentBody, _: None = Depends(require_admin)):
+    cfg = _admin_page_or_404(page)
+    filename = cfg[0]
+    blocks, sha, html = await fetch_blocks(page)
+    if blocks is None or idx < 0 or idx >= len(blocks):
+        raise HTTPException(status_code=404, detail="Item not found")
+    old_block = blocks[idx]
+    if old_block not in html:
+        raise HTTPException(status_code=409, detail="Content changed, refresh and retry")
+    new_block = apply_rich_edit(old_block, body.title, body.content)
+    ok = await gh_put_file(filename, sha, html.replace(old_block, new_block, 1), f"Admin edit: {body.title[:50]}")
+    if not ok:
+        raise HTTPException(status_code=502, detail="GitHub update failed")
+    return {"ok": True}
+
+
+@app.delete("/admin/content/{page}/{idx}")
+async def admin_delete_content(page: str, idx: int, _: None = Depends(require_admin)):
+    cfg = _admin_page_or_404(page)
+    filename = cfg[0]
+    blocks, sha, html = await fetch_blocks(page)
+    if blocks is None or idx < 0 or idx >= len(blocks):
+        raise HTTPException(status_code=404, detail="Item not found")
+    old_block = blocks[idx]
+    if old_block not in html:
+        raise HTTPException(status_code=409, detail="Content changed, refresh and retry")
+    ok = await gh_put_file(filename, sha, html.replace(old_block, "", 1), f"Admin delete: {block_title(old_block)[:50]}")
+    if not ok:
+        raise HTTPException(status_code=502, detail="GitHub update failed")
     return {"ok": True}
