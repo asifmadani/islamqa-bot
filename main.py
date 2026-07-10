@@ -9,7 +9,7 @@ Handles:
   - #book: title + language + PDF → approve → upload PDF + publish to books.html
 """
 
-import os, re, base64, logging, asyncio, tempfile, secrets
+import os, re, base64, logging, asyncio, tempfile, secrets, time
 from contextlib import asynccontextmanager
 from datetime import datetime
 
@@ -72,6 +72,15 @@ def extract_youtube_id(text: str) -> str | None:
         text,
     )
     return m.group(1) if m else None
+
+
+def parse_youtube_input(text: str) -> str:
+    """Accept a full YouTube URL or a bare 11-char video ID."""
+    yt = extract_youtube_id(text)
+    if yt:
+        return yt
+    text = text.strip()
+    return text if re.fullmatch(r'[A-Za-z0-9_-]{11}', text) else ""
 
 
 def parse_hashtag_msg(text: str) -> dict | None:
@@ -188,6 +197,22 @@ async def gh_upload_binary(path: str, file_bytes: bytes, msg: str) -> bool:
 # PUBLISH FUNCTIONS
 # ══════════════════════════════════════════════════════════════════════════════
 
+def render_qa_block(name: str, question: str, content_html: str) -> str:
+    return (
+        f'\n        <div class="qa-item" data-name="{name}">\n'
+        '          <div class="qa-question">\n'
+        f'            <h3>{question}</h3>\n'
+        '            <span class="qa-toggle">+</span>\n'
+        '          </div>\n'
+        '          <div class="qa-answer">\n'
+        f'            <div class="content-body">{content_html}</div>\n'
+        f'            <p style="font-size:0.82rem;color:var(--text-light);margin-top:0.5rem;">'
+        f'— {name} ka sawal</p>\n'
+        '          </div>\n'
+        '        </div>'
+    )
+
+
 async def publish_qa(name: str, question: str, answer: str) -> bool:
     sha, html = await gh_get_file("qa.html")
     if not sha:
@@ -196,20 +221,23 @@ async def publish_qa(name: str, question: str, answer: str) -> bool:
     if marker not in html:
         log.error("BOT:qa marker missing")
         return False
-    block = (
-        '\n        <div class="qa-item">\n'
-        '          <div class="qa-question">\n'
-        f'            <h3>{question}</h3>\n'
-        '            <span class="qa-toggle">+</span>\n'
-        '          </div>\n'
-        '          <div class="qa-answer">\n'
-        f'            <p>{answer}</p>\n'
-        f'            <p style="font-size:0.82rem;color:var(--text-light);margin-top:0.5rem;">'
-        f'— {name} ka sawal</p>\n'
-        '          </div>\n'
-        '        </div>'
-    )
+    block = render_qa_block(name, question, f"<p>{answer}</p>")
     return await gh_put_file("qa.html", sha, html.replace(marker, marker + block, 1), f"Q&A: {question[:60]}")
+
+
+def render_video_block(title: str, content_html: str, youtube_id: str) -> str:
+    return (
+        f'\n      <div class="video-card" data-yt="{youtube_id}">\n'
+        f'        <div class="video-thumb">\n'
+        f'          <iframe src="https://www.youtube.com/embed/{youtube_id}" '
+        f'allowfullscreen title="{title}"></iframe>\n'
+        f'        </div>\n'
+        f'        <div class="video-info">\n'
+        f'          <h3>{title}</h3>\n'
+        f'          <div class="content-body">{content_html}</div>\n'
+        f'        </div>\n'
+        f'      </div>\n'
+    )
 
 
 async def publish_video(title: str, description: str, youtube_id: str) -> bool:
@@ -220,18 +248,7 @@ async def publish_video(title: str, description: str, youtube_id: str) -> bool:
     if marker not in html:
         log.error("BOT:video marker missing")
         return False
-    block = (
-        f'\n      <div class="video-card">\n'
-        f'        <div class="video-thumb">\n'
-        f'          <iframe src="https://www.youtube.com/embed/{youtube_id}" '
-        f'allowfullscreen title="{title}"></iframe>\n'
-        f'        </div>\n'
-        f'        <div class="video-info">\n'
-        f'          <h3>{title}</h3>\n'
-        f'          <p>{description}</p>\n'
-        f'        </div>\n'
-        f'      </div>\n'
-    )
+    block = render_video_block(title, f"<p>{description}</p>", youtube_id)
     return await gh_put_file("videos.html", sha, html.replace(marker, marker + block, 1), f"Video: {title[:60]}")
 
 
@@ -280,6 +297,23 @@ async def publish_tashreeh(title: str, description: str) -> bool:
     return await gh_put_file("tashreeh.html", sha, html.replace(marker, block + marker, 1), f"Tashreeh: {title[:60]}")
 
 
+def render_research_block(title: str, content_html: str, pdf_filename: str) -> str:
+    year = datetime.now().strftime("%Y")
+    dl = (f'\n          <a href="files/{pdf_filename}" download class="btn-download" '
+          f'target="_blank">⬇ Download PDF</a>') if pdf_filename else ""
+    return (
+        f'\n      <div class="pub-card" data-pdf="{pdf_filename}">\n'
+        f'        <div class="pub-icon">📄</div>\n'
+        f'        <div class="pub-info">\n'
+        f'          <h3>{title}</h3>\n'
+        f'          <div class="content-body">{content_html}</div>\n'
+        f'          <span style="color:var(--text-light);font-size:0.82rem;">'
+        f'{year} · Asif Jamiee Madani Hafizahullah</span>{dl}\n'
+        f'        </div>\n'
+        f'      </div>\n'
+    )
+
+
 async def publish_research(title: str, description: str, pdf_filename: str = "") -> bool:
     sha, html = await gh_get_file("research.html")
     if not sha:
@@ -288,21 +322,25 @@ async def publish_research(title: str, description: str, pdf_filename: str = "")
     if marker not in html:
         log.error("BOT:research marker missing")
         return False
-    year = datetime.now().strftime("%Y")
-    dl = (f'\n          <a href="files/{pdf_filename}" download class="btn-download" '
-          f'target="_blank">⬇ Download PDF</a>') if pdf_filename else ""
-    block = (
-        f'\n      <div class="pub-card">\n'
-        f'        <div class="pub-icon">📄</div>\n'
+    block = render_research_block(title, f"<p>{description}</p>", pdf_filename)
+    return await gh_put_file("research.html", sha, html.replace(marker, marker + block, 1), f"Research: {title[:60]}")
+
+
+def render_book_block(title: str, content_html: str, language: str, pdf_filename: str) -> str:
+    icon = "📗" if language.lower() in ("english", "en") else "📘"
+    return (
+        f'\n      <div class="pub-card" data-pdf="{pdf_filename}" data-lang="{language}">\n'
+        f'        <div class="pub-icon">{icon}</div>\n'
         f'        <div class="pub-info">\n'
         f'          <h3>{title}</h3>\n'
-        f'          <p>{description}</p>\n'
+        f'          <div class="content-body">{content_html}</div>\n'
         f'          <span style="color:var(--text-light);font-size:0.82rem;">'
-        f'{year} · Asif Jamiee Madani Hafizahullah</span>{dl}\n'
+        f'Authored by Asif Jamiee Madani Hafizahullah</span><br/><br/>\n'
+        f'          <a href="files/{pdf_filename}" download class="btn-download" '
+        f'target="_blank">⬇ Download PDF</a>\n'
         f'        </div>\n'
         f'      </div>\n'
     )
-    return await gh_put_file("research.html", sha, html.replace(marker, marker + block, 1), f"Research: {title[:60]}")
 
 
 async def publish_book(title: str, description: str, language: str, pdf_filename: str) -> bool:
@@ -313,20 +351,7 @@ async def publish_book(title: str, description: str, language: str, pdf_filename
     if marker not in html:
         log.error("BOT:books marker missing")
         return False
-    icon = "📗" if language.lower() in ("english", "en") else "📘"
-    block = (
-        f'\n      <div class="pub-card">\n'
-        f'        <div class="pub-icon">{icon}</div>\n'
-        f'        <div class="pub-info">\n'
-        f'          <h3>{title}</h3>\n'
-        f'          <p>{description}</p>\n'
-        f'          <span style="color:var(--text-light);font-size:0.82rem;">'
-        f'Authored by Asif Jamiee Madani Hafizahullah</span><br/><br/>\n'
-        f'          <a href="files/{pdf_filename}" download class="btn-download" '
-        f'target="_blank">⬇ Download PDF</a>\n'
-        f'        </div>\n'
-        f'      </div>\n'
-    )
+    block = render_book_block(title, f"<p>{description}</p>", language, pdf_filename)
     return await gh_put_file("books.html", sha, html.replace(marker, marker + block, 1), f"Book: {title[:60]}")
 
 
@@ -799,6 +824,11 @@ def find_blocks(html: str, class_name: str, start_after: str = "", stop_before: 
     return blocks
 
 
+def block_attr(block: str, attr: str) -> str:
+    m = re.search(rf'data-{attr}="([^"]*)"', block)
+    return m.group(1) if m else ""
+
+
 def extract_div(html: str, class_name: str) -> str | None:
     """Return the inner HTML of the first <div class="class_name">...</div> found."""
     tag = f'class="{class_name}"'
@@ -813,18 +843,6 @@ def extract_div(html: str, class_name: str) -> str | None:
         return None
     inner_start = html.find(">", di) + 1
     return html[inner_start:end - 6]
-
-
-def apply_rich_edit(old_block: str, new_title: str, new_content_html: str) -> str:
-    """Replace <h3> and the content-body div's inner HTML with admin-supplied rich HTML."""
-    b = re.sub(r"<h3>.*?</h3>", f"<h3>{new_title}</h3>", old_block, count=1, flags=re.DOTALL)
-    tag = 'class="content-body"'
-    ci = b.find(tag)
-    if ci == -1:
-        return b
-    di = b.rfind("<div", 0, ci)
-    end = _div_end(b, di)
-    return b[:di] + f'<div class="content-body">{new_content_html}</div>' + b[end:]
 
 
 def block_title(block: str) -> str:
@@ -1109,14 +1127,22 @@ async def tg_webhook(request: Request):
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ADMIN PANEL API
-# Only maqalah/tafseer/tashreeh are managed here — research/books/video need
-# PDF/YouTube uploads and stay on the Telegram bot flow for now.
+# Covers every content type the Telegram bot manages: maqalah/tafseer/tashreeh
+# (plain text), video (YouTube link), research/books (optional/required PDF),
+# and qa (question + answer). Q&A intake still happens over Telegram (Sheikh
+# records a voice reply); the admin panel can additionally edit/delete/add.
 # ══════════════════════════════════════════════════════════════════════════════
 
-ADMIN_PAGES = ["maqalah", "tafseer", "tashreeh"]
-# Matches each publish_* function's existing insertion order (maqalah appends
-# after the marker, tafseer/tashreeh append before it).
-_INSERT_AFTER_MARKER = {"maqalah": True, "tafseer": False, "tashreeh": False}
+ADMIN_PAGES = ["maqalah", "tafseer", "tashreeh", "video", "research", "books", "qa"]
+
+_PAGE_KIND = {
+    "maqalah": "topic", "tafseer": "topic", "tashreeh": "topic",
+    "video": "video", "research": "research", "books": "book", "qa": "qa",
+}
+
+# Matches each publish_* function's existing insertion order (most pages append
+# right after the marker; tafseer/tashreeh append right before it).
+_INSERT_AFTER_MARKER = {"tafseer": False, "tashreeh": False}
 
 
 class LoginBody(BaseModel):
@@ -1124,8 +1150,13 @@ class LoginBody(BaseModel):
 
 
 class ContentBody(BaseModel):
-    title: str
-    content: str
+    title: str = ""          # question text for kind="qa"
+    content: str = ""        # rich HTML; answer text for kind="qa"
+    youtube_url: str = ""     # kind="video"
+    language: str = ""        # kind="book"
+    name: str = ""             # kind="qa" — asker's name
+    pdf_base64: str = ""      # kind="research"/"book" — new PDF to upload
+    pdf_filename: str = ""    # set by server after upload; ignored from client otherwise
 
 
 def require_admin(authorization: str = Header(default="")) -> None:
@@ -1140,6 +1171,57 @@ def _admin_page_or_404(page: str) -> tuple:
     return _PAGE_CFG[page]
 
 
+def _safe_pdf_filename(title: str) -> str:
+    safe = re.sub(r'[^a-zA-Z0-9_-]', '-', title or "file")[:40]
+    return f"{safe}-{int(time.time())}.pdf"
+
+
+def _rebuild_block(kind: str, body: ContentBody, existing_block: str | None) -> str:
+    title = body.title.strip()
+    content = body.content
+
+    if kind == "topic":
+        return render_topic_block(title, content)
+
+    if kind == "video":
+        yt = parse_youtube_input(body.youtube_url) if body.youtube_url else ""
+        if not yt:
+            yt = block_attr(existing_block, "yt") if existing_block else ""
+        if not yt:
+            raise HTTPException(status_code=400, detail="Valid YouTube link is required")
+        return render_video_block(title, content, yt)
+
+    if kind == "research":
+        pdf_fn = body.pdf_filename or (block_attr(existing_block, "pdf") if existing_block else "")
+        return render_research_block(title, content, pdf_fn)
+
+    if kind == "book":
+        pdf_fn = body.pdf_filename or (block_attr(existing_block, "pdf") if existing_block else "")
+        lang = body.language or (block_attr(existing_block, "lang") if existing_block else "Urdu")
+        if not pdf_fn:
+            raise HTTPException(status_code=400, detail="PDF file is required for books")
+        return render_book_block(title, content, lang, pdf_fn)
+
+    if kind == "qa":
+        name = body.name or (block_attr(existing_block, "name") if existing_block else "Anonymous")
+        return render_qa_block(name, title, content)
+
+    raise HTTPException(status_code=400, detail="Unsupported page kind")
+
+
+async def _upload_pdf_if_present(body: ContentBody, title: str) -> None:
+    if not body.pdf_base64:
+        return
+    try:
+        pdf_bytes = base64.b64decode(body.pdf_base64)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid PDF data")
+    pdf_fn = _safe_pdf_filename(title)
+    if not await gh_upload_binary(f"files/{pdf_fn}", pdf_bytes, f"PDF: {title[:50]}"):
+        raise HTTPException(status_code=502, detail="PDF upload failed")
+    body.pdf_filename = pdf_fn
+
+
 @app.post("/admin/login")
 async def admin_login(body: LoginBody):
     if not ADMIN_PASSWORD or body.password != ADMIN_PASSWORD:
@@ -1151,7 +1233,7 @@ async def admin_login(body: LoginBody):
 
 @app.get("/admin/pages")
 async def admin_pages(_: None = Depends(require_admin)):
-    return {"pages": [{"key": p, "label": _PAGE_LABEL[p]} for p in ADMIN_PAGES]}
+    return {"pages": [{"key": p, "label": _PAGE_LABEL[p], "kind": _PAGE_KIND[p]} for p in ADMIN_PAGES]}
 
 
 @app.get("/admin/content/{page}")
@@ -1160,30 +1242,54 @@ async def admin_get_content(page: str, _: None = Depends(require_admin)):
     blocks, sha, html = await fetch_blocks(page)
     if blocks is None:
         raise HTTPException(status_code=502, detail="GitHub fetch failed")
-    items = [
-        {"idx": i, "title": block_title(blk), "content": extract_div(blk, "content-body") or ""}
-        for i, blk in enumerate(blocks)
-    ]
+    kind = _PAGE_KIND[page]
+    items = []
+    for i, blk in enumerate(blocks):
+        content = extract_div(blk, "content-body")
+        if content is None:
+            content = f"<p>{block_desc(blk)}</p>"
+        item = {"idx": i, "title": block_title(blk), "content": content}
+        if kind == "video":
+            item["youtube_id"] = block_attr(blk, "yt")
+        elif kind == "research":
+            item["pdf_filename"] = block_attr(blk, "pdf")
+        elif kind == "book":
+            item["pdf_filename"] = block_attr(blk, "pdf")
+            item["language"] = block_attr(blk, "lang") or "Urdu"
+        elif kind == "qa":
+            item["name"] = block_attr(blk, "name")
+        items.append(item)
     return {"items": items}
 
 
 @app.post("/admin/content/{page}")
 async def admin_add_content(page: str, body: ContentBody, _: None = Depends(require_admin)):
     cfg = _admin_page_or_404(page)
+    kind = _PAGE_KIND[page]
     filename, _cls, start_after, stop_before = cfg
+    title = body.title.strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Title/Question is required")
+    if kind == "video" and not body.youtube_url:
+        raise HTTPException(status_code=400, detail="YouTube link is required")
+    if kind == "book" and not body.pdf_base64:
+        raise HTTPException(status_code=400, detail="PDF file is required for books")
+
+    await _upload_pdf_if_present(body, title)
+    block = _rebuild_block(kind, body, None)
+
     marker = stop_before or start_after
     sha, html = await gh_get_file(filename)
     if not sha:
         raise HTTPException(status_code=502, detail="GitHub fetch failed")
     if marker not in html:
         raise HTTPException(status_code=500, detail="Insertion marker missing in page")
-    block = render_topic_block(body.title, body.content)
     new_html = (
         html.replace(marker, marker + block, 1)
         if _INSERT_AFTER_MARKER.get(page, True)
         else html.replace(marker, block + marker, 1)
     )
-    ok = await gh_put_file(filename, sha, new_html, f"Admin add: {body.title[:50]}")
+    ok = await gh_put_file(filename, sha, new_html, f"Admin add: {title[:50]}")
     if not ok:
         raise HTTPException(status_code=502, detail="GitHub update failed")
     return {"ok": True}
@@ -1192,15 +1298,22 @@ async def admin_add_content(page: str, body: ContentBody, _: None = Depends(requ
 @app.put("/admin/content/{page}/{idx}")
 async def admin_edit_content(page: str, idx: int, body: ContentBody, _: None = Depends(require_admin)):
     cfg = _admin_page_or_404(page)
+    kind = _PAGE_KIND[page]
     filename = cfg[0]
+    title = body.title.strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Title/Question is required")
+
     blocks, sha, html = await fetch_blocks(page)
     if blocks is None or idx < 0 or idx >= len(blocks):
         raise HTTPException(status_code=404, detail="Item not found")
     old_block = blocks[idx]
     if old_block not in html:
         raise HTTPException(status_code=409, detail="Content changed, refresh and retry")
-    new_block = apply_rich_edit(old_block, body.title, body.content)
-    ok = await gh_put_file(filename, sha, html.replace(old_block, new_block, 1), f"Admin edit: {body.title[:50]}")
+
+    await _upload_pdf_if_present(body, title)
+    new_block = _rebuild_block(kind, body, old_block)
+    ok = await gh_put_file(filename, sha, html.replace(old_block, new_block, 1), f"Admin edit: {title[:50]}")
     if not ok:
         raise HTTPException(status_code=502, detail="GitHub update failed")
     return {"ok": True}
