@@ -121,6 +121,20 @@ def parse_hashtag_msg(text: str) -> dict | None:
     return result
 
 
+def excerpt(content_html: str, n: int = 160) -> str:
+    """Strip tags and truncate at a word boundary — used for listing-page teasers."""
+    text = re.sub(r"<[^>]+>", " ", content_html)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= n:
+        return text
+    cut = text[:n].rsplit(" ", 1)[0]
+    return cut + "…"
+
+
+def new_item_id() -> str:
+    return str(int(time.time() * 1000))
+
+
 def transcribe_sync(audio_bytes: bytes, suffix: str) -> str:
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp.write(audio_bytes)
@@ -159,18 +173,35 @@ async def gh_get_file(path: str) -> tuple[str, str] | tuple[None, None]:
         return d["sha"], base64.b64decode(d["content"]).decode("utf-8")
 
 
-async def gh_put_file(path: str, sha: str, content: str, msg: str) -> bool:
+async def gh_put_file(path: str, sha: str | None, content: str, msg: str) -> bool:
+    """sha=None creates a new file; a real sha updates the existing one."""
     url = f"https://api.github.com/repos/{GH_REPO}/contents/{path}"
     body = {
         "message": msg,
         "content": base64.b64encode(content.encode()).decode(),
-        "sha": sha,
         "committer": {"name": "Darul Ilm Bot", "email": "bot@darulilm.com"},
     }
+    if sha:
+        body["sha"] = sha
     async with httpx.AsyncClient(timeout=30) as c:
         r = await c.put(url, headers=_GH_HEADERS(), json=body)
         if not r.is_success:
             log.error("GH PUT %s → %s %s", path, r.status_code, r.text[:200])
+            return False
+        return True
+
+
+async def gh_delete_file(path: str, sha: str, msg: str) -> bool:
+    url = f"https://api.github.com/repos/{GH_REPO}/contents/{path}"
+    body = {
+        "message": msg,
+        "sha": sha,
+        "committer": {"name": "Darul Ilm Bot", "email": "bot@darulilm.com"},
+    }
+    async with httpx.AsyncClient(timeout=30) as c:
+        r = await c.request("DELETE", url, headers=_GH_HEADERS(), json=body)
+        if not r.is_success:
+            log.error("GH DELETE %s → %s %s", path, r.status_code, r.text[:200])
             return False
         return True
 
@@ -193,19 +224,231 @@ async def gh_upload_binary(path: str, file_bytes: bytes, msg: str) -> bool:
         return True
 
 
+# page_type → (filename, div_class, start_after, stop_before)
+_PAGE_CFG = {
+    "qa":       ("qa.html",       "qa-item",    "<h2>Published Answers</h2>", ""),
+    "maqalah":  ("maqalah.html",  "topic-card", 'id="bot-maqalah">',         "<!-- BOT:maqalah -->"),
+    "tafseer":  ("tafseer.html",  "topic-card", 'id="bot-tafseer">',         "<!-- BOT:tafseer -->"),
+    "tashreeh": ("tashreeh.html", "topic-card", 'id="bot-tashreeh">',        "<!-- BOT:tashreeh -->"),
+    "research": ("research.html", "pub-card",   '<div class="pub-list">',    "<!-- BOT:research -->"),
+    "books":    ("books.html",    "pub-card",   '<div class="pub-list">',    "<!-- BOT:books -->"),
+    "video":    ("videos.html",   "video-card", "<!-- BOT:video -->",         ""),
+}
+
+_PAGE_LABEL = {
+    "qa": "Q&A", "maqalah": "Maqalah", "tafseer": "Tafseer",
+    "tashreeh": "Tashreeh", "research": "Research", "books": "Books", "video": "Videos",
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DETAIL PAGES (individual permanent URL per published item — SEO)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_DETAIL_HERO = {
+    "qa": "💬 Questions & Answers", "maqalah": "📖 Maqalah", "tafseer": "📜 Tafseer",
+    "tashreeh": "📋 Tashreeh", "research": "🔬 Research Papers", "books": "📚 Published Books",
+    "video": "🎥 Video Lectures",
+}
+
+
+def _detail_json_ld(kind: str, item_id: str, title: str, content_html: str, url: str, extra: dict) -> str:
+    desc = excerpt(content_html, 300)
+    if kind == "qa":
+        data = {
+            "@context": "https://schema.org", "@type": "QAPage",
+            "mainEntity": {
+                "@type": "Question", "name": title,
+                "acceptedAnswer": {"@type": "Answer", "text": desc},
+            },
+        }
+    elif kind == "video":
+        data = {
+            "@context": "https://schema.org", "@type": "VideoObject",
+            "name": title, "description": desc,
+            "thumbnailUrl": f"https://img.youtube.com/vi/{extra.get('youtube_id', '')}/hqdefault.jpg",
+            "embedUrl": f"https://www.youtube.com/embed/{extra.get('youtube_id', '')}",
+            "uploadDate": datetime.now().strftime("%Y-%m-%d"),
+        }
+    elif kind == "books":
+        data = {
+            "@context": "https://schema.org", "@type": "Book",
+            "name": title, "description": desc, "inLanguage": extra.get("language", "Urdu"),
+            "author": {"@type": "Person", "name": "Asif Jamiee Madani Hafizahullah"},
+        }
+    else:  # maqalah, tafseer, tashreeh, research
+        data = {
+            "@context": "https://schema.org", "@type": "Article",
+            "headline": title, "description": desc,
+            "author": {"@type": "Person", "name": "Asif Jamiee Madani Hafizahullah"},
+        }
+    breadcrumb = {
+        "@context": "https://schema.org", "@type": "BreadcrumbList",
+        "itemListElement": [
+            {"@type": "ListItem", "position": 1, "name": "Home", "item": "https://asifmadani.github.io/"},
+            {"@type": "ListItem", "position": 2, "name": _PAGE_LABEL[kind], "item": f"https://asifmadani.github.io/{_PAGE_CFG[kind][0]}"},
+            {"@type": "ListItem", "position": 3, "name": title, "item": url},
+        ],
+    }
+    import json as _json
+    return (
+        f'  <script type="application/ld+json">{_json.dumps(data)}</script>\n'
+        f'  <script type="application/ld+json">{_json.dumps(breadcrumb)}</script>\n'
+    )
+
+
+def render_detail_page(kind: str, item_id: str, title: str, content_html: str, extra: dict | None = None) -> str:
+    extra = extra or {}
+    label = _PAGE_LABEL[kind]
+    listing_file = _PAGE_CFG[kind][0]
+    url = f"https://asifmadani.github.io/{kind}/{item_id}.html"
+    desc = excerpt(content_html, 155)
+    safe_title = title.strip() or label
+    page_title = f"{safe_title} — Asif Jamiee Madani Hafizahullah"
+    json_ld = _detail_json_ld(kind, item_id, safe_title, content_html, url, extra)
+
+    extra_body = ""
+    if kind == "video" and extra.get("youtube_id"):
+        extra_body = (
+            f'      <div class="video-thumb" style="margin-bottom:1.25rem;">\n'
+            f'        <iframe src="https://www.youtube.com/embed/{extra["youtube_id"]}" '
+            f'allowfullscreen title="{safe_title}"></iframe>\n'
+            f'      </div>\n'
+        )
+    elif kind in ("research", "books") and extra.get("pdf_filename"):
+        extra_body = (
+            f'      <a href="../files/{extra["pdf_filename"]}" download class="btn-download" '
+            f'target="_blank">⬇ Download PDF</a>\n'
+        )
+
+    return f'''<!DOCTYPE html>
+<html lang="en" dir="ltr">
+<head>
+  <meta charset="UTF-8" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>%F0%9F%95%8C</text></svg>" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{page_title}</title>
+  <meta name="description" content="{desc}" />
+  <link rel="canonical" href="{url}" />
+
+  <meta property="og:type" content="article" />
+  <meta property="og:site_name" content="Asif Jamiee Madani Hafizahullah" />
+  <meta property="og:title" content="{page_title}" />
+  <meta property="og:description" content="{desc}" />
+  <meta property="og:url" content="{url}" />
+  <meta property="og:image" content="https://asifmadani.github.io/images/maqalah-1.jpg" />
+
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="{page_title}" />
+  <meta name="twitter:description" content="{desc}" />
+  <meta name="twitter:image" content="https://asifmadani.github.io/images/maqalah-1.jpg" />
+  <link rel="stylesheet" href="../css/style.css" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Amiri:ital,wght@0,400;0,700;1,400&family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet" />
+{json_ld}</head>
+<body>
+
+  <div id="google_translate_element" style="display:none;"></div>
+  <script>
+    function googleTranslateElementInit() {{
+      new google.translate.TranslateElement({{
+        pageLanguage: 'en',
+        includedLanguages: 'ar,bn,gu,hi,kn,ml,mr,or,pa,ps,sd,ta,te,ur,fa,en',
+        layout: google.translate.TranslateElement.InlineLayout.SIMPLE,
+        autoDisplay: false
+      }}, 'google_translate_element');
+    }}
+  </script>
+  <script src="//translate.google.com/translate_a/element.js?cb=googleTranslateElementInit"></script>
+
+  <nav class="navbar">
+    <div class="nav-container">
+      <a href="../index.html" class="nav-logo">
+        <span class="arabic-logo">﷽</span>
+        <span class="logo-text">Asif Jamiee Madani Hafizahullah</span>
+      </a>
+      <button class="nav-toggle" id="navToggle">&#9776;</button>
+      <ul class="nav-links" id="navLinks">
+        <li><a href="../index.html">Home</a></li>
+        <li><a href="../maqalah.html">Maqalah</a></li>
+        <li><a href="../tafseer.html">Tafseer</a></li>
+        <li><a href="../tashreeh.html">Tashreeh</a></li>
+        <li><a href="../videos.html">Videos</a></li>
+        <li><a href="../research.html">Research</a></li>
+        <li><a href="../books.html">Books</a></li>
+        <li><a href="../qa.html">Q&amp;A</a></li>
+        <li><a href="../contact.html">Contact</a></li>
+      </ul>
+      <div class="nav-right">
+        <div class="lang-item">
+          <button class="lang-btn" id="langBtn">🌐 <span>English</span></button>
+          <div class="lang-dropdown" id="langDropdown"></div>
+        </div>
+        <div class="nav-social">
+          <a href="https://youtube.com/@darulilm3716" target="_blank" rel="noopener" class="nav-social-icon yt" title="YouTube">▶</a>
+          <a href="https://t.me/+OTs9l7p6_ntjNDE1" target="_blank" rel="noopener" class="nav-social-icon tg" title="Telegram">✈</a>
+        </div>
+      </div>
+    </div>
+  </nav>
+
+  <div class="page-hero">
+    <p style="font-size:0.85rem;"><a href="../index.html" style="color:inherit;">Home</a> › <a href="../{listing_file}" style="color:inherit;">{label}</a></p>
+    <h1>{safe_title}</h1>
+  </div>
+
+  <main class="container page-content">
+    <article>
+{extra_body}      <div class="content-body">{content_html}</div>
+    </article>
+    <p style="margin-top:2rem;"><a href="../{listing_file}" style="color:var(--green-mid);">← {label} par wapas jayein</a></p>
+  </main>
+
+  <footer class="footer">
+    <div class="container">
+      <p class="footer-arabic">جَزَاكُمُ اللَّهُ خَيْرًا</p>
+      <div class="footer-social">
+        <a href="https://youtube.com/@darulilm3716" target="_blank" rel="noopener" class="yt-link">▶ YouTube</a>
+        <a href="https://t.me/+OTs9l7p6_ntjNDE1" target="_blank" rel="noopener" class="tg-link">✈ Telegram</a>
+      </div>
+      <p>© 2025 Asif Jamiee Madani Hafizahullah. All rights reserved.</p>
+      <p class="footer-links">
+        <a href="../maqalah.html">Maqalah</a> &middot;
+        <a href="../tafseer.html">Tafseer</a> &middot;
+        <a href="../tashreeh.html">Tashreeh</a> &middot;
+        <a href="../videos.html">Videos</a> &middot;
+        <a href="../research.html">Research</a> &middot;
+        <a href="../books.html">Books</a> &middot;
+        <a href="../qa.html">Q&amp;A</a> &middot;
+        <a href="../contact.html">Contact</a>
+      </p>
+    </div>
+  </footer>
+
+  <div class="float-social">
+    <a href="https://youtube.com/@darulilm3716" target="_blank" rel="noopener" class="float-btn yt" title="YouTube">▶</a>
+    <a href="https://t.me/+OTs9l7p6_ntjNDE1" target="_blank" rel="noopener" class="float-btn tg" title="Telegram">✈</a>
+  </div>
+
+  <script src="../js/main.js"></script>
+</body>
+</html>
+'''
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # PUBLISH FUNCTIONS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def render_qa_block(name: str, question: str, content_html: str) -> str:
+def render_qa_block(name: str, question: str, content_html: str, item_id: str) -> str:
     return (
-        f'\n        <div class="qa-item" data-name="{name}">\n'
+        f'\n        <div class="qa-item" data-name="{name}" data-id="{item_id}">\n'
         '          <div class="qa-question">\n'
-        f'            <h3>{question}</h3>\n'
-        '            <span class="qa-toggle">+</span>\n'
+        f'            <h3><a href="qa/{item_id}.html">{question}</a></h3>\n'
         '          </div>\n'
         '          <div class="qa-answer">\n'
-        f'            <div class="content-body">{content_html}</div>\n'
+        f'            <div class="content-body"><p>{excerpt(content_html)} '
+        f'<a href="qa/{item_id}.html">Poora jawab padhein →</a></p></div>\n'
         f'            <p style="font-size:0.82rem;color:var(--text-light);margin-top:0.5rem;">'
         f'— {name} ka sawal</p>\n'
         '          </div>\n'
@@ -221,20 +464,26 @@ async def publish_qa(name: str, question: str, answer: str) -> bool:
     if marker not in html:
         log.error("BOT:qa marker missing")
         return False
-    block = render_qa_block(name, question, f"<p>{answer}</p>")
+    item_id = new_item_id()
+    content_html = f"<p>{answer}</p>"
+    detail = render_detail_page("qa", item_id, question, content_html)
+    if not await gh_put_file(f"qa/{item_id}.html", None, detail, f"Q&A detail: {question[:60]}"):
+        return False
+    block = render_qa_block(name, question, content_html, item_id)
     return await gh_put_file("qa.html", sha, html.replace(marker, marker + block, 1), f"Q&A: {question[:60]}")
 
 
-def render_video_block(title: str, content_html: str, youtube_id: str) -> str:
+def render_video_block(title: str, content_html: str, youtube_id: str, item_id: str) -> str:
     return (
-        f'\n      <div class="video-card" data-yt="{youtube_id}">\n'
+        f'\n      <div class="video-card" data-yt="{youtube_id}" data-id="{item_id}">\n'
         f'        <div class="video-thumb">\n'
         f'          <iframe src="https://www.youtube.com/embed/{youtube_id}" '
         f'allowfullscreen title="{title}"></iframe>\n'
         f'        </div>\n'
         f'        <div class="video-info">\n'
-        f'          <h3>{title}</h3>\n'
-        f'          <div class="content-body">{content_html}</div>\n'
+        f'          <h3><a href="video/{item_id}.html">{title}</a></h3>\n'
+        f'          <div class="content-body"><p>{excerpt(content_html)} '
+        f'<a href="video/{item_id}.html">Poora padhein →</a></p></div>\n'
         f'        </div>\n'
         f'      </div>\n'
     )
@@ -248,15 +497,21 @@ async def publish_video(title: str, description: str, youtube_id: str) -> bool:
     if marker not in html:
         log.error("BOT:video marker missing")
         return False
-    block = render_video_block(title, f"<p>{description}</p>", youtube_id)
+    item_id = new_item_id()
+    content_html = f"<p>{description}</p>"
+    detail = render_detail_page("video", item_id, title, content_html, {"youtube_id": youtube_id})
+    if not await gh_put_file(f"video/{item_id}.html", None, detail, f"Video detail: {title[:60]}"):
+        return False
+    block = render_video_block(title, content_html, youtube_id, item_id)
     return await gh_put_file("videos.html", sha, html.replace(marker, marker + block, 1), f"Video: {title[:60]}")
 
 
-def render_topic_block(title: str, content_html: str) -> str:
+def render_topic_block(title: str, content_html: str, item_id: str, kind: str) -> str:
     return (
-        f'\n      <div class="topic-card">\n'
-        f'        <h3>{title}</h3>\n'
-        f'        <div class="content-body">{content_html}</div>\n'
+        f'\n      <div class="topic-card" data-id="{item_id}">\n'
+        f'        <h3><a href="{kind}/{item_id}.html">{title}</a></h3>\n'
+        f'        <div class="content-body"><p>{excerpt(content_html)} '
+        f'<a href="{kind}/{item_id}.html">Poora padhein →</a></p></div>\n'
         f'      </div>\n'
     )
 
@@ -269,7 +524,12 @@ async def publish_maqalah(title: str, description: str) -> bool:
     if marker not in html:
         log.error("BOT:maqalah marker missing")
         return False
-    block = render_topic_block(title, f"<p>{description}</p>")
+    item_id = new_item_id()
+    content_html = f"<p>{description}</p>"
+    detail = render_detail_page("maqalah", item_id, title, content_html)
+    if not await gh_put_file(f"maqalah/{item_id}.html", None, detail, f"Maqalah detail: {title[:60]}"):
+        return False
+    block = render_topic_block(title, content_html, item_id, "maqalah")
     return await gh_put_file("maqalah.html", sha, html.replace(marker, marker + block, 1), f"Maqalah: {title[:60]}")
 
 
@@ -281,7 +541,12 @@ async def publish_tafseer(title: str, description: str) -> bool:
     if marker not in html:
         log.error("BOT:tafseer marker missing")
         return False
-    block = render_topic_block(title, f"<p>{description}</p>")
+    item_id = new_item_id()
+    content_html = f"<p>{description}</p>"
+    detail = render_detail_page("tafseer", item_id, title, content_html)
+    if not await gh_put_file(f"tafseer/{item_id}.html", None, detail, f"Tafseer detail: {title[:60]}"):
+        return False
+    block = render_topic_block(title, content_html, item_id, "tafseer")
     return await gh_put_file("tafseer.html", sha, html.replace(marker, block + marker, 1), f"Tafseer: {title[:60]}")
 
 
@@ -293,20 +558,26 @@ async def publish_tashreeh(title: str, description: str) -> bool:
     if marker not in html:
         log.error("BOT:tashreeh marker missing")
         return False
-    block = render_topic_block(title, f"<p>{description}</p>")
+    item_id = new_item_id()
+    content_html = f"<p>{description}</p>"
+    detail = render_detail_page("tashreeh", item_id, title, content_html)
+    if not await gh_put_file(f"tashreeh/{item_id}.html", None, detail, f"Tashreeh detail: {title[:60]}"):
+        return False
+    block = render_topic_block(title, content_html, item_id, "tashreeh")
     return await gh_put_file("tashreeh.html", sha, html.replace(marker, block + marker, 1), f"Tashreeh: {title[:60]}")
 
 
-def render_research_block(title: str, content_html: str, pdf_filename: str) -> str:
+def render_research_block(title: str, content_html: str, pdf_filename: str, item_id: str) -> str:
     year = datetime.now().strftime("%Y")
     dl = (f'\n          <a href="files/{pdf_filename}" download class="btn-download" '
           f'target="_blank">⬇ Download PDF</a>') if pdf_filename else ""
     return (
-        f'\n      <div class="pub-card" data-pdf="{pdf_filename}">\n'
+        f'\n      <div class="pub-card" data-pdf="{pdf_filename}" data-id="{item_id}">\n'
         f'        <div class="pub-icon">📄</div>\n'
         f'        <div class="pub-info">\n'
-        f'          <h3>{title}</h3>\n'
-        f'          <div class="content-body">{content_html}</div>\n'
+        f'          <h3><a href="research/{item_id}.html">{title}</a></h3>\n'
+        f'          <div class="content-body"><p>{excerpt(content_html)} '
+        f'<a href="research/{item_id}.html">Poora padhein →</a></p></div>\n'
         f'          <span style="color:var(--text-light);font-size:0.82rem;">'
         f'{year} · Asif Jamiee Madani Hafizahullah</span>{dl}\n'
         f'        </div>\n'
@@ -322,18 +593,24 @@ async def publish_research(title: str, description: str, pdf_filename: str = "")
     if marker not in html:
         log.error("BOT:research marker missing")
         return False
-    block = render_research_block(title, f"<p>{description}</p>", pdf_filename)
+    item_id = new_item_id()
+    content_html = f"<p>{description}</p>"
+    detail = render_detail_page("research", item_id, title, content_html, {"pdf_filename": pdf_filename})
+    if not await gh_put_file(f"research/{item_id}.html", None, detail, f"Research detail: {title[:60]}"):
+        return False
+    block = render_research_block(title, content_html, pdf_filename, item_id)
     return await gh_put_file("research.html", sha, html.replace(marker, marker + block, 1), f"Research: {title[:60]}")
 
 
-def render_book_block(title: str, content_html: str, language: str, pdf_filename: str) -> str:
+def render_book_block(title: str, content_html: str, language: str, pdf_filename: str, item_id: str) -> str:
     icon = "📗" if language.lower() in ("english", "en") else "📘"
     return (
-        f'\n      <div class="pub-card" data-pdf="{pdf_filename}" data-lang="{language}">\n'
+        f'\n      <div class="pub-card" data-pdf="{pdf_filename}" data-lang="{language}" data-id="{item_id}">\n'
         f'        <div class="pub-icon">{icon}</div>\n'
         f'        <div class="pub-info">\n'
-        f'          <h3>{title}</h3>\n'
-        f'          <div class="content-body">{content_html}</div>\n'
+        f'          <h3><a href="books/{item_id}.html">{title}</a></h3>\n'
+        f'          <div class="content-body"><p>{excerpt(content_html)} '
+        f'<a href="books/{item_id}.html">Poora padhein →</a></p></div>\n'
         f'          <span style="color:var(--text-light);font-size:0.82rem;">'
         f'Authored by Asif Jamiee Madani Hafizahullah</span><br/><br/>\n'
         f'          <a href="files/{pdf_filename}" download class="btn-download" '
@@ -351,7 +628,12 @@ async def publish_book(title: str, description: str, language: str, pdf_filename
     if marker not in html:
         log.error("BOT:books marker missing")
         return False
-    block = render_book_block(title, f"<p>{description}</p>", language, pdf_filename)
+    item_id = new_item_id()
+    content_html = f"<p>{description}</p>"
+    detail = render_detail_page("books", item_id, title, content_html, {"language": language, "pdf_filename": pdf_filename})
+    if not await gh_put_file(f"books/{item_id}.html", None, detail, f"Book detail: {title[:60]}"):
+        return False
+    block = render_book_block(title, content_html, language, pdf_filename, item_id)
     return await gh_put_file("books.html", sha, html.replace(marker, marker + block, 1), f"Book: {title[:60]}")
 
 
@@ -727,7 +1009,21 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         page      = draft["page"]
         old_block = draft["old_block"]
-        new_block = apply_edit(old_block, new_title, new_desc)
+        kind      = _PAGE_KIND[page]
+        item_id   = block_attr(old_block, "id") or new_item_id()
+        content_html = f"<p>{new_desc}</p>"
+        try:
+            new_block, extra = _rebuild_block(kind, ContentBody(title=new_title, content=content_html), old_block, item_id, page)
+        except HTTPException as exc:
+            await msg.reply_text(f"❌ {exc.detail}")
+            return
+
+        detail_path = f"{page}/{item_id}.html"
+        detail_sha, _ = await gh_get_file(detail_path)
+        detail = render_detail_page(page, item_id, new_title, content_html, extra)
+        if not await gh_put_file(detail_path, detail_sha, detail, f"Edit detail: {new_title[:50]}"):
+            await msg.reply_text("❌ Detail page update fail hua.")
+            return
 
         cfg = _PAGE_CFG[page]
         sha, html = await gh_get_file(cfg[0])
@@ -855,28 +1151,6 @@ def block_desc(block: str) -> str:
     return re.sub(r"<[^>]+>", "", m.group(1)).strip()[:200] if m else ""
 
 
-def apply_edit(old_block: str, new_title: str, new_desc: str) -> str:
-    """Replace <h3> and first <p> in a block with new values."""
-    b = re.sub(r"<h3>.*?</h3>", f"<h3>{new_title}</h3>", old_block, count=1, flags=re.DOTALL)
-    b = re.sub(r"<p>.*?</p>", f"<p>{new_desc}</p>", b, count=1, flags=re.DOTALL)
-    return b
-
-
-# page_type → (filename, div_class, start_after, stop_before)
-_PAGE_CFG = {
-    "qa":       ("qa.html",       "qa-item",    "<h2>Published Answers</h2>", ""),
-    "maqalah":  ("maqalah.html",  "topic-card", 'id="bot-maqalah">',         "<!-- BOT:maqalah -->"),
-    "tafseer":  ("tafseer.html",  "topic-card", 'id="bot-tafseer">',         "<!-- BOT:tafseer -->"),
-    "tashreeh": ("tashreeh.html", "topic-card", 'id="bot-tashreeh">',        "<!-- BOT:tashreeh -->"),
-    "research": ("research.html", "pub-card",   '<div class="pub-list">',    "<!-- BOT:research -->"),
-    "books":    ("books.html",    "pub-card",   '<div class="pub-list">',    "<!-- BOT:books -->"),
-    "video":    ("videos.html",   "video-card", "<!-- BOT:video -->",         ""),
-}
-
-_PAGE_LABEL = {
-    "qa": "Q&A", "maqalah": "Maqalah", "tafseer": "Tafseer",
-    "tashreeh": "Tashreeh", "research": "Research", "books": "Books", "video": "Videos",
-}
 
 
 async def fetch_blocks(page: str) -> tuple[list[str], str, str] | tuple[None, None, None]:
@@ -1032,6 +1306,12 @@ async def handle_manage_callback(query, ctx: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ Item HTML mein nahi mila. Shayad already delete ho gaya?")
             return
 
+        item_id = block_attr(blk, "id")
+        if item_id:
+            detail_sha, _ = await gh_get_file(f"{page}/{item_id}.html")
+            if detail_sha:
+                await gh_delete_file(f"{page}/{item_id}.html", detail_sha, f"Delete detail: {title[:50]}")
+
         new_html = html.replace(blk, "", 1)
         ok = await gh_put_file(cfg[0], sha, new_html, f"Delete: {title[:50]}")
 
@@ -1176,12 +1456,13 @@ def _safe_pdf_filename(title: str) -> str:
     return f"{safe}-{int(time.time())}.pdf"
 
 
-def _rebuild_block(kind: str, body: ContentBody, existing_block: str | None) -> str:
+def _rebuild_block(kind: str, body: ContentBody, existing_block: str | None, item_id: str, page: str) -> tuple[str, dict]:
+    """Returns (listing_block_html, extra_meta_for_detail_page)."""
     title = body.title.strip()
     content = body.content
 
     if kind == "topic":
-        return render_topic_block(title, content)
+        return render_topic_block(title, content, item_id, page), {}
 
     if kind == "video":
         yt = parse_youtube_input(body.youtube_url) if body.youtube_url else ""
@@ -1189,22 +1470,22 @@ def _rebuild_block(kind: str, body: ContentBody, existing_block: str | None) -> 
             yt = block_attr(existing_block, "yt") if existing_block else ""
         if not yt:
             raise HTTPException(status_code=400, detail="Valid YouTube link is required")
-        return render_video_block(title, content, yt)
+        return render_video_block(title, content, yt, item_id), {"youtube_id": yt}
 
     if kind == "research":
         pdf_fn = body.pdf_filename or (block_attr(existing_block, "pdf") if existing_block else "")
-        return render_research_block(title, content, pdf_fn)
+        return render_research_block(title, content, pdf_fn, item_id), {"pdf_filename": pdf_fn}
 
     if kind == "book":
         pdf_fn = body.pdf_filename or (block_attr(existing_block, "pdf") if existing_block else "")
         lang = body.language or (block_attr(existing_block, "lang") if existing_block else "Urdu")
         if not pdf_fn:
             raise HTTPException(status_code=400, detail="PDF file is required for books")
-        return render_book_block(title, content, lang, pdf_fn)
+        return render_book_block(title, content, lang, pdf_fn, item_id), {"language": lang, "pdf_filename": pdf_fn}
 
     if kind == "qa":
         name = body.name or (block_attr(existing_block, "name") if existing_block else "Anonymous")
-        return render_qa_block(name, title, content)
+        return render_qa_block(name, title, content, item_id), {}
 
     raise HTTPException(status_code=400, detail="Unsupported page kind")
 
@@ -1245,7 +1526,17 @@ async def admin_get_content(page: str, _: None = Depends(require_admin)):
     kind = _PAGE_KIND[page]
     items = []
     for i, blk in enumerate(blocks):
-        content = extract_div(blk, "content-body")
+        # Listing block only holds an excerpt now — pull the full content
+        # from the item's own detail page (falls back to the listing block
+        # for pre-migration items that don't have a data-id yet).
+        item_id = block_attr(blk, "id")
+        content = None
+        if item_id:
+            _, detail_html = await gh_get_file(f"{page}/{item_id}.html")
+            if detail_html:
+                content = extract_div(detail_html, "content-body")
+        if content is None:
+            content = extract_div(blk, "content-body")
         if content is None:
             content = f"<p>{block_desc(blk)}</p>"
         item = {"idx": i, "title": block_title(blk), "content": content}
@@ -1276,7 +1567,12 @@ async def admin_add_content(page: str, body: ContentBody, _: None = Depends(requ
         raise HTTPException(status_code=400, detail="PDF file is required for books")
 
     await _upload_pdf_if_present(body, title)
-    block = _rebuild_block(kind, body, None)
+    item_id = new_item_id()
+    block, extra = _rebuild_block(kind, body, None, item_id, page)
+
+    detail = render_detail_page(page, item_id, title, body.content, extra)
+    if not await gh_put_file(f"{page}/{item_id}.html", None, detail, f"Admin add detail: {title[:50]}"):
+        raise HTTPException(status_code=502, detail="GitHub detail page create failed")
 
     marker = stop_before or start_after
     sha, html = await gh_get_file(filename)
@@ -1312,7 +1608,15 @@ async def admin_edit_content(page: str, idx: int, body: ContentBody, _: None = D
         raise HTTPException(status_code=409, detail="Content changed, refresh and retry")
 
     await _upload_pdf_if_present(body, title)
-    new_block = _rebuild_block(kind, body, old_block)
+    item_id = block_attr(old_block, "id") or new_item_id()
+    new_block, extra = _rebuild_block(kind, body, old_block, item_id, page)
+
+    detail_path = f"{page}/{item_id}.html"
+    detail_sha, _ = await gh_get_file(detail_path)
+    detail = render_detail_page(page, item_id, title, body.content, extra)
+    if not await gh_put_file(detail_path, detail_sha, detail, f"Admin edit detail: {title[:50]}"):
+        raise HTTPException(status_code=502, detail="GitHub detail page update failed")
+
     ok = await gh_put_file(filename, sha, html.replace(old_block, new_block, 1), f"Admin edit: {title[:50]}")
     if not ok:
         raise HTTPException(status_code=502, detail="GitHub update failed")
@@ -1329,6 +1633,13 @@ async def admin_delete_content(page: str, idx: int, _: None = Depends(require_ad
     old_block = blocks[idx]
     if old_block not in html:
         raise HTTPException(status_code=409, detail="Content changed, refresh and retry")
+
+    item_id = block_attr(old_block, "id")
+    if item_id:
+        detail_sha, _ = await gh_get_file(f"{page}/{item_id}.html")
+        if detail_sha:
+            await gh_delete_file(f"{page}/{item_id}.html", detail_sha, f"Admin delete detail: {block_title(old_block)[:50]}")
+
     ok = await gh_put_file(filename, sha, html.replace(old_block, "", 1), f"Admin delete: {block_title(old_block)[:50]}")
     if not ok:
         raise HTTPException(status_code=502, detail="GitHub update failed")
