@@ -227,11 +227,17 @@ async def gh_upload_binary(path: str, file_bytes: bytes, msg: str) -> bool:
 # page_type → (filename, div_class, start_after, stop_before)
 _PAGE_CFG = {
     "qa":       ("qa.html",       "qa-item",    "<h2>Published Answers</h2>", ""),
-    "maqalah":  ("maqalah.html",  "topic-card", 'id="bot-maqalah">',         "<!-- BOT:maqalah -->"),
+    # maqalah/research/books publish AFTER the "<!-- BOT:x -->" marker (same as
+    # qa/video below), so it must be start_after with an open-ended stop_before —
+    # using it as stop_before (as tafseer/tashreeh correctly do, since those
+    # insert BEFORE their marker) made find_blocks search a zero-width window
+    # right between the two markers, so real published items were always
+    # invisible to admin/Telegram listing, edit, and delete.
+    "maqalah":  ("maqalah.html",  "topic-card", "<!-- BOT:maqalah -->",  ""),
     "tafseer":  ("tafseer.html",  "topic-card", 'id="bot-tafseer">',         "<!-- BOT:tafseer -->"),
     "tashreeh": ("tashreeh.html", "topic-card", 'id="bot-tashreeh">',        "<!-- BOT:tashreeh -->"),
-    "research": ("research.html", "pub-card",   '<div class="pub-list">',    "<!-- BOT:research -->"),
-    "books":    ("books.html",    "pub-card",   '<div class="pub-list">',    "<!-- BOT:books -->"),
+    "research": ("research.html", "pub-card",   "<!-- BOT:research -->", ""),
+    "books":    ("books.html",    "pub-card",   "<!-- BOT:books -->",    ""),
     "video":    ("videos.html",   "video-card", "<!-- BOT:video -->",         ""),
 }
 
