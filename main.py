@@ -28,7 +28,7 @@ from groq import Groq
 TG_TOKEN       = os.environ["TG_TOKEN"]
 TG_CHAT_ID     = int(os.environ["TG_CHAT_ID"])
 GROQ_KEY       = os.environ["GROQ_KEY"]
-GH_TOKEN       = os.environ["GH_TOKEN"]
+GH_TOKEN       = os.environ.get("GH_TOKEN", "").strip()
 GH_REPO        = "asifmadani/asifmadani.github.io"
 WEBHOOK_URL    = os.environ["WEBHOOK_URL"]
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
@@ -156,16 +156,24 @@ def transcribe_sync(audio_bytes: bytes, suffix: str) -> str:
 # GITHUB HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
-_GH_HEADERS = lambda: {
-    "Authorization": f"token {GH_TOKEN}",
-    "Accept": "application/vnd.github.v3+json",
-}
+def _gh_headers(*, write: bool = False) -> dict[str, str]:
+    """Use authentication only where GitHub requires it.
+
+    The Pages repository is public, so a stale write token must not break
+    admin listings and reads. Writes still require a valid token.
+    """
+    headers = {"Accept": "application/vnd.github.v3+json"}
+    if write:
+        if not GH_TOKEN:
+            raise RuntimeError("GH_TOKEN is required for GitHub writes")
+        headers["Authorization"] = f"token {GH_TOKEN}"
+    return headers
 
 
 async def gh_get_file(path: str) -> tuple[str, str] | tuple[None, None]:
     url = f"https://api.github.com/repos/{GH_REPO}/contents/{path}"
     async with httpx.AsyncClient(timeout=30) as c:
-        r = await c.get(url, headers=_GH_HEADERS())
+        r = await c.get(url, headers=_gh_headers())
         if not r.is_success:
             log.error("GH GET %s → %s", path, r.status_code)
             return None, None
@@ -184,7 +192,12 @@ async def gh_put_file(path: str, sha: str | None, content: str, msg: str) -> boo
     if sha:
         body["sha"] = sha
     async with httpx.AsyncClient(timeout=30) as c:
-        r = await c.put(url, headers=_GH_HEADERS(), json=body)
+        try:
+            headers = _gh_headers(write=True)
+        except RuntimeError as exc:
+            log.error("GH PUT %s: %s", path, exc)
+            return False
+        r = await c.put(url, headers=headers, json=body)
         if not r.is_success:
             log.error("GH PUT %s → %s %s", path, r.status_code, r.text[:200])
             return False
@@ -199,7 +212,12 @@ async def gh_delete_file(path: str, sha: str, msg: str) -> bool:
         "committer": {"name": "Darul Ilm Bot", "email": "bot@darulilm.com"},
     }
     async with httpx.AsyncClient(timeout=30) as c:
-        r = await c.request("DELETE", url, headers=_GH_HEADERS(), json=body)
+        try:
+            headers = _gh_headers(write=True)
+        except RuntimeError as exc:
+            log.error("GH DELETE %s: %s", path, exc)
+            return False
+        r = await c.request("DELETE", url, headers=headers, json=body)
         if not r.is_success:
             log.error("GH DELETE %s → %s %s", path, r.status_code, r.text[:200])
             return False
@@ -214,10 +232,15 @@ async def gh_upload_binary(path: str, file_bytes: bytes, msg: str) -> bool:
         "committer": {"name": "Darul Ilm Bot", "email": "bot@darulilm.com"},
     }
     async with httpx.AsyncClient(timeout=120) as c:
-        r_get = await c.get(url, headers=_GH_HEADERS())
+        r_get = await c.get(url, headers=_gh_headers())
         if r_get.is_success:
             body["sha"] = r_get.json()["sha"]
-        r = await c.put(url, headers=_GH_HEADERS(), json=body)
+        try:
+            headers = _gh_headers(write=True)
+        except RuntimeError as exc:
+            log.error("GH UPLOAD %s: %s", path, exc)
+            return False
+        r = await c.put(url, headers=headers, json=body)
         if not r.is_success:
             log.error("GH PUT binary %s → %s %s", path, r.status_code, r.text[:200])
             return False
