@@ -157,16 +157,20 @@ def transcribe_sync(audio_bytes: bytes, suffix: str) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _gh_headers(*, write: bool = False) -> dict[str, str]:
-    """Use authentication only where GitHub requires it.
+    """Authenticate GitHub API requests with the Render PAT.
 
-    The Pages repository is public, so a stale write token must not break
-    admin listings and reads. Writes still require a valid token.
+    The Pages repository is public, but unauthenticated reads are limited to
+    a shared IP quota on Render. That quota caused the admin panel to work
+    briefly and then fail with GitHub 403 responses.
     """
-    headers = {"Accept": "application/vnd.github.v3+json"}
-    if write:
-        if not GH_TOKEN:
-            raise RuntimeError("GH_TOKEN is required for GitHub writes")
-        headers["Authorization"] = f"token {GH_TOKEN}"
+    headers = {
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if GH_TOKEN:
+        headers["Authorization"] = f"Bearer {GH_TOKEN}"
+    elif write:
+        raise RuntimeError("GH_TOKEN is required for GitHub writes")
     return headers
 
 
@@ -175,7 +179,7 @@ async def gh_get_file(path: str) -> tuple[str, str] | tuple[None, None]:
     async with httpx.AsyncClient(timeout=30) as c:
         r = await c.get(url, headers=_gh_headers())
         if not r.is_success:
-            log.error("GH GET %s → %s", path, r.status_code)
+            log.error("GH GET %s → %s %s", path, r.status_code, r.text[:300])
             return None, None
         d = r.json()
         return d["sha"], base64.b64decode(d["content"]).decode("utf-8")
